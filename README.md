@@ -103,6 +103,16 @@ With `--gpus` pointed at the 170HX pair only:
 
 ## Scaling up: Maya-L and where the extra experts should live
 
+> **UPDATE 2026-10-21: Maya-L is now PROD on this rig** — 4 GPUs, 1M context, parallel 4.
+> Measured: warm decode 44-46 t/s (cold-boot ~34 — warm before quoting), prefill 420-600 t/s,
+> full battery PASS. A/B: pair-only 18.3 t/s; 4-GPU 44-46 warm; 4-GPU+DFlash2 28-34 (no gain,
+> dropped); Maya-M pair 50. L won on fidelity (99.2%/90%) at ~10% speed cost. Config:
+> `--max-context 1048576 --prefill 32768 --parallel 4` + `MAYA_GLM_CKPT_EVERY=0`,
+> `MAYA_GLM_RAM_HEADROOM_GB=24`. Gotchas learned: the engine picks GPUs by PHYSICAL NVML
+> index (CUDA_VISIBLE_DEVICES ignored at serve time — a UUID-pinned setup writes wrong
+> indices); L-4GPU calibration wedges (log frozen, process alive — kill and serve
+> pre-calibration; warm-cache performance made it moot).
+
 Maya-L (156.3 GB, 99.2% of FP8 zero-shot, 90% token-identical) needs ~146 GB of experts —
 more than the pair's ~104 GB of VRAM. Analysis of the placement options:
 
