@@ -81,7 +81,7 @@ With `--gpus` pointed at the 170HX pair only:
 | Decode, single stream (512 tok) | 38.2 t/s → **48-50 t/s after calibration** |
 | Prefill 8K | ~503 t/s |
 | Prefill 821K (1M mode) | **594 t/s sustained** (950 shallow → slower as the sparse index grows); TTFT 23 min |
-| Needle retrieval @ 821K tokens, 93% depth | **HIT** — exact sentence found and quoted (expert cache 93.2% at depth) |
+| Needle retrieval @ 821K tokens, 93% depth | **VERIFIED ×2** — run 1 located the exact sentence (refused to quote only because the needle text itself said "do not share"; test-design bug, not retrieval failure); run 2 (secrecy-free needle) quoted it **verbatim**: "MARLINE-7741-QUARTZ". 576-594 t/s prefill both runs, expert cache 93.2% at depth |
 | Vision (rendered-text card) | PASS, ~7 s |
 | Tool calls (`tool_choice: auto`) | PASS, clean JSON args |
 | Wrong API key | 401; `/health` unauthenticated 200 |
@@ -100,3 +100,32 @@ With `--gpus` pointed at the 170HX pair only:
 - Rollback to the vLLM lane: `docker start <vllm-container>` after stopping Maya by the
   exact PID holding the port. Pause any auto-restart watchdog for the vLLM container
   **before** the swap or it will relaunch vLLM into GPUs Maya now owns.
+
+## Scaling up: Maya-L and where the extra experts should live
+
+Maya-L (156.3 GB, 99.2% of FP8 zero-shot, 90% token-identical) needs ~146 GB of experts —
+more than the pair's ~104 GB of VRAM. Analysis of the placement options:
+
+- **`MAYA_GLM_EXPERT_HELPER` doesn't fit a two-card trunk.** The helper design puts the
+  whole trunk (all layers + attention + MTP) on GPU 0 and a complementary expert cache on
+  GPU 1 (`MAYA_GLM_SPLIT=0`). A single 64 GB trunk + 24 GB helper ≈ 74 GB of expert
+  capacity — strictly worse than the pair's layer split (~92 GB). Helper is for
+  one-big-GPU + small-servant rigs.
+- **Layer-split onto the small cards flips calculus for L** (it didn't for M): the split
+  search prices every placement — per-layer hop (~0.4 ms fixed), card bandwidth, misses at
+  host-RAM speed. When everything fits on the big cards, it gives small cards zero-slot
+  pity layers (the 4-GPU trap above). When the model *doesn't* fit, hosting real expert
+  slots on a 936 GB/s 3090 can beat 35 GB/s pinned RAM despite the hops.
+- **DFlash2 drafter is the 3+ GPU unlock:** under its pipelined window the cards pipeline
+  draft rounds instead of every token crossing every card serially (upstream datapoint:
+  Maya-L on a 3090 + 8× 5060 Ti = 61.6 t/s). Test matrix for L: pair+RAM baseline →
+  4-GPU auto split (`MAYA_GLM_SPLIT_LOG=1` prints every placement's prediction before
+  load) → 4-GPU + DFlash2.
+
+## GPUDirect Storage: not applicable (checked)
+
+The engine has **no cuFile path** (reads its SSD tier via O_DIRECT + pinned staging +
+`cudaMemcpy`), and at 100%-experts-in-VRAM the disk tier is unused during serving. A
+kernel NVMe-hook patch to enable GDS accelerates nothing until software *calls* cuFile —
+worth revisiting only for a heavily disk-tiered model (e.g. DeepSeek-V4.1 Maya-S, 340 GB)
+and only if the engine grows a cuFile read path.
