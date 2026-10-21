@@ -1,141 +1,131 @@
-# Serving GLM-5.3-Flash (321B) on a CMP 170HX pair with Project Maya
+# Serving GLM-5.3-Flash (321B) on CMP 170HX + RTX 3090 with Project Maya
 
-**Status: PROD lane since 2026-10-20** (replaces the vLLM Flash-Next lane on the same port;
-that recipe is kept in this repo as the one-command rollback).
+**PROD lane: Maya-L (156.3 GB, 99.2% of FP8 fidelity) on 4 GPUs, native 1M context,
+~45 t/s warm decode** (since 2026-10-21). Previously: Maya-M on the 170HX pair
+(2026-10-20, kept below as the speed config); vLLM Flash-Next before that (one
+`docker start` rollback).
 
 ## Hardware
 
 | | |
 |---|---|
-| GPUs | 2× NVIDIA CMP 170HX — one 64 GB, one 40 GB (GA100, BAR1-unlocked, PCIe **Gen2 x4**) |
+| GPUs | CMP 170HX 64 GB + CMP 170HX 40 GB (GA100, BAR1-unlocked, PCIe **Gen2 x4**) + 2× RTX 3090 |
 | CPU | Xeon E5-2690 v4 (AVX2) |
-| RAM | 185 GB |
-| Disk | NVMe SSD, ~120 GB free needed for the model |
-
-The same host also carries 2× RTX 3090 — which are **deliberately NOT used** (see the
-4-GPU trap below).
+| RAM | 184 GB |
+| Disk | NVMe — ~160 GB free needed for Maya-L (model + pack + vision) |
 
 ## Model
 
-GLM-5.3-Flash (zai-org, MIT) — 321B-parameter MoE, ~18B active/token, native 1M context.
-Served with [Project Maya](https://github.com/mw00/project-maya) v1.1.19 and its
-**Maya-M** quant (116 GB GGUF): routed experts IQ2_S/IQ3_S with GPTQ-style error-feedback
-rounding against per-expert FP8 statistics, attention/shared experts Q6_K. Keeps 97.9% of
-the FP8 model's zero-shot accuracy, 86% same-next-token.
+GLM-5.3-Flash (zai-org, MIT) — 321B-parameter MoE, ~18B active/token, native 1M context,
+3:1 linear/sparse-attention hybrid: only ~14 layers even have a KV cache, so 1M context
+costs ~11 GB of streamed latent KV, not hundreds of GB.
+
+Two quants, both measured on this rig:
+
+| Quant | Size | FP8 zero-shot | Token-identical | Warm decode |
+|---|---|---|---|---|
+| **Maya-L** — IQ3_S/IQ4_XS experts, Q5_K in the sensitive layers | 156.3 GB | **99.2%** | **90%** | 44-46 t/s (4 GPUs) |
+| Maya-M — IQ2_S/IQ3_S, Q6_K, calibrated toward tool calls / front-end code | 116 GB | 97.9% | 86% | 50 t/s (170HX pair) |
+
+## Topology: size-conditional GPU choice (the hard-won rule)
+
+Maya splits by **layers** and sizes per-GPU expert pools from free VRAM.
+
+- **Model fits the 170HX pair (~≤116 GB total experts) → `gpu: [2,3]` ONLY.** Adding the
+  3090s when they're not needed is a trap: the auto-split gives them one thin layer each
+  with **zero expert slots** — pure Gen2 pipeline hops. Measured: decode 20-36 t/s and
+  prefill collapse (~15 t/s) from prompt buffers borrowing a packed card's expert pool.
+- **Model does NOT fit the pair (Maya-L) → `gpu: [0,1,2,3]`.** The 3090s host real expert
+  slots (~21 GB each), the RAM tier shrinks ~30 GB, decode nearly doubles (18.3 → 44-46
+  t/s). The calculus flips because the overflow must live somewhere — 936 GB/s VRAM beats
+  35 GB/s pinned RAM even with the hops.
+- `MAYA_GLM_EXPERT_HELPER` needs a single-GPU trunk — not viable on a two-card trunk.
+- **DFlash2 drafter: no gain here** (28-34 t/s ≈ no-draft) — on a mixed 3090/170HX pool
+  the slowest card paces every draft round. Upstream's 61.6 t/s (3090 + 8× 5060 Ti) did
+  not reproduce on this topology.
+- Engine build is per-arch: `CMAKE_CUDA_ARCHITECTURES="80;86"` covers both card types.
+
+**⚠️ GPU-selection gotcha (cost three failed launches):** the engine picks GPUs by
+**physical NVML index** from the config's `gpu: [...]` and **ignores `CUDA_VISIBLE_DEVICES`
+at serve time**. A setup run under a UUID pin with `--gpus 0,1` silently records the 3090s.
+Write physical indices into the config and verify against `nvidia-smi` before starting.
+
+## Production config (Maya-L, 1M context, 4 GPUs)
+
+```jsonc
+// maya-maya-l.json
+{ "gpu": [0, 1, 2, 3],
+  "args": ["--glm-pack", "<models>/Maya-L/pack", "--max-context", "1048576",
+           "--expert-cache", "auto", "--prefill", "32768", "--kv-streaming", "on",
+           "--expert-profile", "<data>/expert-profile-glm.bin", "--parallel", "4"],
+  "env": { "MAYA_GLM_CKPT_EVERY": "0", "MAYA_GLM_RAM_HEADROOM_GB": "24" },
+  "port": 8012, "host": "0.0.0.0", "api_key": "<key>" }
+```
+
+- **`--parallel 4` at 1M:** each conversation keeps its own ~11 GB latent-KV host copy;
+  8× would crowd system RAM. Total pinned ≈ 128 GB of 184.
+- **`--prefill 32768`:** ~2× prompt speed vs the auto 8192 on a split.
+- **`MAYA_GLM_CKPT_EVERY=0`:** fresh long reads −37% (each mid-read checkpoint piece pays
+  a fixed ~14.6 s fill; upstream measured 148.8 → 93.2 s on a 100K read).
+- **`--kv-streaming on`:** non-negotiable at 1M — hot window in VRAM, latent tail in
+  pinned RAM. A 900K prompt reads at ~500 t/s with it; ~15 t/s without.
+
+## Measured (this rig, warm, temp 0.7)
+
+| Metric | Maya-L 4-GPU | Maya-M pair |
+|---|---|---|
+| Decode, single stream | **44-46 t/s** (cold-boot reads ~34 — always warm before quoting) | 50 t/s after calibration |
+| Prefill @8K | 420-600 t/s | ~503 t/s |
+| Prefill 821K (1M mode) | — | 576-594 t/s sustained, TTFT ~23 min |
+| Needle @821K, 93% depth | — | **verified ×2, verbatim quote**, expert cache 93.2% at depth |
+| Vision / tool calls / model-alias passthrough / wrong-key 401 | all PASS | all PASS |
 
 ## Install (non-interactive)
 
 ```sh
-git clone --depth 1 https://github.com/mw00/project-maya.git
-cd project-maya
-# one GPU visible at first (coexist eval); pin by UUID — CUDA order ≠ nvidia-smi order
-CUDA_VISIBLE_DEVICES=GPU-<uuid> ./maya.sh --setup --yes --plain --model Maya-M \
-  --gpu 0 --port <port> --host-compiler /usr/bin/g++-13 \
-  --no-start --download-model --no-speed-calibration
+git clone --depth 1 https://github.com/mw00/project-maya.git && cd project-maya
+./maya.sh --setup --yes --plain --model Maya-L --gpus 0,1,2,3 \
+  --context 65536 --parallel 8 --port <port> --host 0.0.0.0 --api-key <key> \
+  --host-compiler /usr/bin/g++-13 --no-start --download-model --no-speed-calibration
+# then edit the written maya-maya-l.json: gpu indices, --max-context, --prefill, --parallel, env
 ```
 
 Gotchas hit on this host:
 
-- **Host compiler:** system gcc 15 is too new for CUDA 12.4's nvcc. `--host-compiler
-  /usr/bin/g++-13` (gcc-13 installed side by side) fixes it.
-- **Port:** pick one that isn't your reverse proxy's.
-- **`--no-start`:** first start pins almost all free RAM for the expert tier — launch it
-  yourself when the machine is ready (`MAYA_GLM_RAM_HEADROOM_GB` raises the floor left
-  for the system; default 6 GB).
-- Long builds/downloads must be spawned detached (`subprocess.Popen(..., start_new_session=True)`)
-  — anything tied to a terminal session's lifetime can be killed mid-ninja.
-
-## Topology: the 170HX pair ONLY — the 4-GPU trap
-
-Maya splits by **layers** and sizes a per-GPU expert pool from free VRAM. On a mixed
-64+40+24+24 GB pool the auto-split assigned each 3090 **one thin layer with ZERO expert
-slots** — pure pipeline hops over Gen2 x4 — and packed every routed expert onto the 170HX
-pair. Result: decode 20-36 t/s and prefill collapse (~15 t/s) from prompt buffers
-borrowing a full card's expert pool.
-
-With `--gpus` pointed at the 170HX pair only:
-
-- Layers [0,28) on the 64 GB card (282 slots/layer), [28,45) on the 40 GB (232 slots/layer)
-- **100% of routed experts in VRAM**, boot ~90 s, both 3090s free for other lanes
-- The engine build is per-arch: `CMAKE_CUDA_ARCHITECTURES="80;86"` if you ever move it.
-
-## Production config
-
-```jsonc
-// maya-maya-m.json (args)
-["--glm-pack", "<models>/Maya-M/pack", "--max-context", "1048576",
- "--expert-cache", "auto", "--prefill", "32768", "--kv-streaming", "on",
- "--parallel", "4"]
-// port 8012, host 0.0.0.0, api_key set — drop-in for the vLLM lane
-```
-
-- **`--parallel 4`, not 8, at 1M context:** every concurrent conversation keeps its own
-  ~11 GB latent-KV host copy; 8× would crowd system RAM.
-- **`--prefill 32768`:** ~2× prompt speed vs the auto 8192 on a two-GPU split.
-- **`--calibrate`** (10-15 min): +31% decode on this host (38 → 50 t/s).
-
-## Measured (this host, warm, temp 0.7)
-
-| Metric | Value |
-|---|---|
-| Decode, single stream (512 tok) | 38.2 t/s → **48-50 t/s after calibration** |
-| Prefill 8K | ~503 t/s |
-| Prefill 821K (1M mode) | **594 t/s sustained** (950 shallow → slower as the sparse index grows); TTFT 23 min |
-| Needle retrieval @ 821K tokens, 93% depth | **VERIFIED ×2** — run 1 located the exact sentence (refused to quote only because the needle text itself said "do not share"; test-design bug, not retrieval failure); run 2 (secrecy-free needle) quoted it **verbatim**: "MARLINE-7741-QUARTZ". 576-594 t/s prefill both runs, expert cache 93.2% at depth |
-| Vision (rendered-text card) | PASS, ~7 s |
-| Tool calls (`tool_choice: auto`) | PASS, clean JSON args |
-| Wrong API key | 401; `/health` unauthenticated 200 |
+- **Host compiler:** system gcc 15 is too new for CUDA 12.4's nvcc —
+  `--host-compiler /usr/bin/g++-13` (gcc-13 installed side by side).
+- **`--no-start`:** first start pins almost all free RAM for the expert tier.
+- Long builds/downloads must be spawned detached
+  (`subprocess.Popen(..., start_new_session=True)`) — anything tied to a terminal
+  session's lifetime can be killed mid-ninja. Downloads are `curl -C -` resumable.
+- **Calibration on L-4GPU wedges** (log frozen ≥90 min, process alive; M calibrated in
+  15 min). Kill it and serve pre-calibration — warm-cache performance made it moot.
+- Thinking model: small `max_tokens` gets eaten by reasoning before `content` — probe ≥300.
 
 ## Ops notes
 
-- The chat path **ignores the request's `model` field** (llama.cpp-style) — clients
-  sending the previous lane's model alias keep working untouched; `/v1/models` lists the
-  real name.
-- Both OpenAI (`/v1/chat/completions`, `/v1/responses`) and Anthropic
-  (`/v1/messages`) APIs are served — agent harnesses can point either way.
-- Thinking model: small `max_tokens` gets eaten by reasoning before `content` — probe
-  with ≥300.
-- **Cold 1M prompts cost ~20-25 min each** (load-once / interrogate-many is the right
-  pattern; for repeated cold huge ingests a batched vLLM lane is still the tool).
-- Rollback to the vLLM lane: `docker start <vllm-container>` after stopping Maya by the
-  exact PID holding the port. Pause any auto-restart watchdog for the vLLM container
-  **before** the swap or it will relaunch vLLM into GPUs Maya now owns.
+- The chat path **ignores the request's `model` field** (llama.cpp-style) — legacy client
+  aliases keep working. Both OpenAI (`/v1/chat/completions`, `/v1/responses`) and
+  Anthropic (`/v1/messages`) APIs are served.
+- **Cold 800K+ prompts cost ~20-25 min each** — load-once / interrogate-many is the right
+  pattern; repeated cold huge ingests want a batched vLLM lane.
+- Kill servers by the **exact PID holding the port** (`ss -tlnp`). `pgrep -f maya`
+  matches your own shell (if the pattern appears in your command) and the model
+  *downloader* (also `maya.py`) — put kills in a minimal standalone call, launches in
+  another.
+- Rollback ladder: Maya-M config (`maya-maya-m.json`, pair, 50 t/s) → vLLM container
+  (`docker start`). Pause any vLLM auto-restart watchdog **before** any swap, or it
+  relaunches vLLM into GPUs Maya owns.
 
-## Scaling up: Maya-L and where the extra experts should live
+## Not applicable, checked (revisit on a second 64 GB card)
 
-> **UPDATE 2026-10-21: Maya-L is now PROD on this rig** — 4 GPUs, 1M context, parallel 4.
-> Measured: warm decode 44-46 t/s (cold-boot ~34 — warm before quoting), prefill 420-600 t/s,
-> full battery PASS. A/B: pair-only 18.3 t/s; 4-GPU 44-46 warm; 4-GPU+DFlash2 28-34 (no gain,
-> dropped); Maya-M pair 50. L won on fidelity (99.2%/90%) at ~10% speed cost. Config:
-> `--max-context 1048576 --prefill 32768 --parallel 4` + `MAYA_GLM_CKPT_EVERY=0`,
-> `MAYA_GLM_RAM_HEADROOM_GB=24`. Gotchas learned: the engine picks GPUs by PHYSICAL NVML
-> index (CUDA_VISIBLE_DEVICES ignored at serve time — a UUID-pinned setup writes wrong
-> indices); L-4GPU calibration wedges (log frozen, process alive — kill and serve
-> pre-calibration; warm-cache performance made it moot).
-
-Maya-L (156.3 GB, 99.2% of FP8 zero-shot, 90% token-identical) needs ~146 GB of experts —
-more than the pair's ~104 GB of VRAM. Analysis of the placement options:
-
-- **`MAYA_GLM_EXPERT_HELPER` doesn't fit a two-card trunk.** The helper design puts the
-  whole trunk (all layers + attention + MTP) on GPU 0 and a complementary expert cache on
-  GPU 1 (`MAYA_GLM_SPLIT=0`). A single 64 GB trunk + 24 GB helper ≈ 74 GB of expert
-  capacity — strictly worse than the pair's layer split (~92 GB). Helper is for
-  one-big-GPU + small-servant rigs.
-- **Layer-split onto the small cards flips calculus for L** (it didn't for M): the split
-  search prices every placement — per-layer hop (~0.4 ms fixed), card bandwidth, misses at
-  host-RAM speed. When everything fits on the big cards, it gives small cards zero-slot
-  pity layers (the 4-GPU trap above). When the model *doesn't* fit, hosting real expert
-  slots on a 936 GB/s 3090 can beat 35 GB/s pinned RAM despite the hops.
-- **DFlash2 drafter is the 3+ GPU unlock:** under its pipelined window the cards pipeline
-  draft rounds instead of every token crossing every card serially (upstream datapoint:
-  Maya-L on a 3090 + 8× 5060 Ti = 61.6 t/s). Test matrix for L: pair+RAM baseline →
-  4-GPU auto split (`MAYA_GLM_SPLIT_LOG=1` prints every placement's prediction before
-  load) → 4-GPU + DFlash2.
-
-## GPUDirect Storage: not applicable (checked)
-
-The engine has **no cuFile path** (reads its SSD tier via O_DIRECT + pinned staging +
-`cudaMemcpy`), and at 100%-experts-in-VRAM the disk tier is unused during serving. A
-kernel NVMe-hook patch to enable GDS accelerates nothing until software *calls* cuFile —
-worth revisiting only for a heavily disk-tiered model (e.g. DeepSeek-V4.1 Maya-S, 340 GB)
-and only if the engine grows a cuFile read path.
+- **GPUDirect Storage:** no cuFile path in the engine (O_DIRECT + pinned staging +
+  `cudaMemcpy`); at mostly-experts-in-VRAM the disk tier is idle. Relevant only for a
+  heavily disk-tiered model (DeepSeek-V4.1 Maya-S, 340 GB) AND a cuFile read path.
+- **EAGLE-4:** no GLM-5.3-Flash draft exists (only Qwen3.8-27B), and Maya's engine has no
+  EAGLE integration. Would also require vLLM/SGLang target support, which GLM lacks.
+- **Flun/glm53-flash-cmp170hx-exl3** (full-HBM EXL3 + DFlash2 K7, 384K): requires a
+  matched 2×64 GB pair — our 64+40 doesn't qualify. The blueprint for a true pair.
+- Maya can run turboderp's EXL3 3.05/4.05bpw quants natively (with tiering), which also
+  unlocks `MAYA_GLM_PREFILL_CALC` (+25-48% prompt speed on no-P2P pairs) — untested here,
+  the natural next experiment.
