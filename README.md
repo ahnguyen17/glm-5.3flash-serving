@@ -64,7 +64,9 @@ Write physical indices into the config and verify against `nvidia-smi` before st
 
 - **`--parallel 4` at 1M:** each conversation keeps its own ~11 GB latent-KV host copy;
   8× would crowd system RAM. Total pinned ≈ 128 GB of 184.
-- **`--prefill 32768`:** ~2× prompt speed vs the auto 8192 on a split.
+- **`--prefill 2048`** (swept on this rig: 2048→454, 8192→442, 32768→418 t/s on 4K unique
+  prompts — smaller chunks borrow less expert pool; monotonic, ~+9% vs the old 32768).
+  At 24 GB-card scale (community report) the effect is much larger — tune per rig.
 - **`MAYA_GLM_CKPT_EVERY=0`:** fresh long reads −37% (each mid-read checkpoint piece pays
   a fixed ~14.6 s fill; upstream measured 148.8 → 93.2 s on a 100K read).
 - **`--kv-streaming on`:** non-negotiable at 1M — hot window in VRAM, latent tail in
@@ -116,6 +118,17 @@ Gotchas hit on this host:
 - Rollback ladder: Maya-M config (`maya-maya-m.json`, pair, 50 t/s) → vLLM container
   (`docker start`). Pause any vLLM auto-restart watchdog **before** any swap, or it
   relaunches vLLM into GPUs Maya owns.
+
+## Host tuning (free, measured where noted)
+
+- CPU governor `performance` + 170HX SM clock locks (`nvidia-smi -lgc 1695` / 1410) via
+  `glm-perf.service` (systemd, enabled) — clock-ramp jitter removal.
+- **Check HBM clocks per card:** this rig's 40 GB card advertises a 1215 MHz HBM max vs
+  1728 on the 64 GB card — a 30% bandwidth deficit the placement search doesn't know
+  about. Community rigs have found mismatched VBIOS HBM clocks worth +3-6% when
+  equalizable; ours is a hard max. Bias hot layers toward the faster card if you can.
+- Engine upgraded to v1.1.21 (prefill time-breakdown tracing, stop-during-long-prompts,
+  EXL3/DFlash2 improvements). Warm decode on v1.1.21: ~38-40 t/s sustained.
 
 ## Not applicable, checked (revisit on a second 64 GB card)
 
